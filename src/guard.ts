@@ -105,18 +105,23 @@ export class CheckoutGuard {
       return undefined;
     }
 
-    // The command may EXECUTE somewhere other than the session cwd.
+    // The command may EXECUTE somewhere other than the session cwd. Only ops
+    // resolving into THE SAME shared checkout are guarded: isolated targets
+    // are branch-local; a target resolving to a DIFFERENT checkout (or to no
+    // workspace at all — a brand-new dir, an unrelated tree) is not this
+    // session's shared root and must pass (incident: `git init` in a fresh
+    // sibling project dir was blocked as a shared-root mutation).
     const targetRaw = execDir || extractCdTarget(command);
     if (targetRaw) {
       const abs = path.isAbsolute(targetRaw) ? targetRaw : path.resolve(sessionCwd, stripQuotes(targetRaw));
       const target = resolveWorkspace(abs);
-      if (target && target.sessionKind === "isolated") return undefined;
+      if (!target || target.sessionKind === "isolated" || target.root !== this.ws.root) return undefined;
     }
     const gitC = extractGitCDir(command);
     if (gitC) {
       const abs = path.isAbsolute(gitC) ? gitC : path.resolve(sessionCwd, stripQuotes(gitC));
       const target = resolveWorkspace(abs);
-      if (target && target.sessionKind === "isolated") return undefined;
+      if (!target || target.sessionKind === "isolated" || target.root !== this.ws.root) return undefined;
     }
 
     if (isReadOnlyMention(command)) return undefined;

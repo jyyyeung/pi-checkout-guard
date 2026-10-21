@@ -163,6 +163,33 @@ test("guard: broad add blocked with peer; override env and read-only prefix pass
   child.kill();
 });
 
+test("guard: ops in a DIFFERENT checkout or a workspace-less dir are never blocked (regression: git init in fresh sibling dir)", () => {
+  const root = plainRepo();
+  const ws = resolveWorkspace(root)!;
+  const guard = new CheckoutGuard(ws, { pid: process.pid, name: "test" });
+  const child = liveChild();
+  appendPresence(ws.registryPath, { name: "peer", pid: child.pid, cwd: root });
+
+  // different checkout (another repo)
+  const other = plainRepo();
+  assert.equal(guard.onBashCommand(`cd ${other} && git merge main`, undefined, root), undefined);
+  // no workspace at all (fresh dir, no git, no config)
+  const bare = fs.mkdtempSync(path.join(os.tmpdir(), "ccg-bare-"));
+  assert.equal(guard.onBashCommand(`cd ${bare} && git init`, undefined, root), undefined);
+  // same-root child repo still guarded (config marker declares one workspace)
+  const wsRoot = tmpdir();
+  write(wsRoot, ".pi-checkout-guard.json", "{}");
+  const childRepo = path.join(wsRoot, "backend");
+  fs.mkdirSync(path.join(childRepo, ".git"), { recursive: true });
+  const ws2 = resolveWorkspace(wsRoot)!;
+  const guard2 = new CheckoutGuard(ws2, { pid: process.pid, name: "test" });
+  const peer2 = liveChild();
+  appendPresence(ws2.registryPath, { name: "peer", pid: peer2.pid, cwd: wsRoot });
+  assert.ok(guard2.onBashCommand(`cd ${childRepo} && git merge main`, undefined, wsRoot)?.block);
+  peer2.kill();
+  child.kill();
+});
+
 test("guard: ops resolving into isolated dirs are never blocked", () => {
   const root = tmpdir();
   write(root, ".pi-checkout-guard.json", "{}");
