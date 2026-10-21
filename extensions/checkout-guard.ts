@@ -28,24 +28,38 @@
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import * as fs from "node:fs";
 import { CheckoutGuard, sessionDisplayName } from "../src/guard.ts";
 import { appendClaim, appendPresence, removeSelf } from "../src/registry.ts";
 import { resolveWorkspace } from "../src/resolve.ts";
+
+const TRACE = process.env.CHECKOUT_GUARD_TRACE === "1";
+function trace(msg: string): void {
+  if (!TRACE) return;
+  try {
+    fs.appendFileSync("/tmp/ccg-trace.log", `${Date.now()} ${msg}\n`);
+  } catch {
+    /* tracing best-effort */
+  }
+}
 
 export default function checkoutGuardExtension(pi: ExtensionAPI): void {
   if (process.env.CHECKOUT_GUARD_DISABLE === "1") return;
 
   const cwd = process.cwd();
+  trace(`factory cwd=${cwd}`);
   const ws = resolveWorkspace(cwd);
   if (!ws) return; // not a workspace we understand; passive
 
   const guard = new CheckoutGuard(ws, { pid: process.pid, name: sessionDisplayName() });
 
   pi.on("session_start", async () => {
+    trace("session_start");
     appendPresence(guard.registryPath, guard.presenceRow(cwd));
   });
 
   pi.on("session_shutdown", async () => {
+    trace("session_shutdown");
     removeSelf(guard.registryPath, guard.selfPid);
   });
 
@@ -65,6 +79,7 @@ export default function checkoutGuardExtension(pi: ExtensionAPI): void {
   pi.on("tool_call", async (event) => {
     const toolName: string = (event as { toolName?: string }).toolName ?? "";
     const input = ((event as { input?: unknown }).input ?? {}) as Record<string, unknown>;
+    trace(`tool_call ${toolName} ${(typeof input.command === "string" ? input.command : "").slice(0, 60)}`);
 
     if (toolName === "bash" || toolName === "bash-in") {
       const command = typeof input.command === "string" ? input.command : "";
