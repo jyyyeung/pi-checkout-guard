@@ -97,19 +97,19 @@ test("registry: pid liveness filters dead and self; expireAt rows honored", () =
   const ws = resolveWorkspace(root)!;
   const reg = ws.registryPath;
   const child = liveChild();
-  let fakeNow = Date.now();
+  const fakeNow = Date.now();
   const now = () => fakeNow;
   appendPresence(reg, { name: "live-peer", pid: child.pid, cwd: root }, now);
   appendPresence(reg, { name: "dead-peer", pid: 2147483000, cwd: root }, now); // nonexistent pid
   appendPresence(reg, { name: "self", pid: process.pid, cwd: root }, now);
-  appendPresence(reg, { name: "ttl-peer", expireAt: Date.now() + 60_000, cwd: root }, now);
-  appendPresence(reg, { name: "expired-peer", expireAt: Date.now() - 1, cwd: root }, now);
+  appendPresence(reg, { name: "ttl-peer", expireAt: fakeNow + 60_000, cwd: root }, now);
+  appendPresence(reg, { name: "expired-peer", expireAt: fakeNow - 1, cwd: root }, now);
 
   const live = readLivePeers(reg, process.pid, 12 * 3600_000, now);
   assert.deepEqual(live.map((p) => p.name).sort(), ["live-peer", "ttl-peer"]);
 
-  fakeNow += 13 * 3600_000; // everything stale now
-  assert.equal(readLivePeers(reg, process.pid, 12 * 3600_000, now).length, 0);
+  const later = fakeNow + 13 * 3600_000; // everything stale by then
+  assert.equal(readLivePeers(reg, process.pid, 12 * 3600_000, () => later).length, 0);
   child.kill();
 });
 
