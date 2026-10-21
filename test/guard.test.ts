@@ -163,6 +163,21 @@ test("guard: broad add blocked with peer; override env and read-only prefix pass
   child.kill();
 });
 
+test("guard: plain mutating verbs (push/commit) pass even with live peers", () => {
+  const root = plainRepo();
+  const ws = resolveWorkspace(root)!;
+  const guard = new CheckoutGuard(ws, { pid: process.pid, name: "test" });
+  const child = liveChild();
+  appendPresence(ws.registryPath, { name: "peer", pid: child.pid, cwd: root });
+
+  assert.equal(guard.onBashCommand("git push -q -u origin main", undefined, root), undefined);
+  assert.equal(guard.onBashCommand('git commit -q -m "feat: x"', undefined, root), undefined);
+  assert.equal(guard.onBashCommand("git pull --rebase", undefined, root), undefined);
+  // graded classes still block with the same peer present
+  assert.ok(guard.onBashCommand("git checkout main", undefined, root)?.block);
+  child.kill();
+});
+
 test("guard: ops in a DIFFERENT checkout or a workspace-less dir are never blocked (regression: git init in fresh sibling dir)", () => {
   const root = plainRepo();
   const ws = resolveWorkspace(root)!;

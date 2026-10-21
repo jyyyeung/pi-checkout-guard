@@ -145,6 +145,13 @@ export class CheckoutGuard {
 
     if (!this.ws.config.gitGuard) return undefined;
 
+    // Only the graded classes guard; a plain mutating verb (push/pull/commit)
+    // is normal work — peers do not veto it (regression: `git push` of an
+    // unrelated-to-peers branch was blocked while peers were live).
+    if (!verdict.destructive && !verdict.broadAdd && !verdict.amend && !verdict.resetHard) {
+      return undefined;
+    }
+
     const peers = this.livePeers();
     const unconditional = verdict.amend || verdict.resetHard;
     if (!unconditional && peers.length === 0) return undefined;
