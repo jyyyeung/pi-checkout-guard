@@ -61,7 +61,8 @@ function isDir(p: string): boolean {
   }
 }
 
-function readMarker(dir: string, marker: string): Record<string, string> {
+/** Parse a marker/meta file as KEY=VALUE lines; unreadable -> {}. */
+export function readMarker(dir: string, marker: string): Record<string, string> {
   const out: Record<string, string> = {};
   try {
     const text = fs.readFileSync(path.join(dir, marker), "utf8");

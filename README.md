@@ -30,10 +30,11 @@ session A (shared root)                session B (shared root)
 |---|---|
 | **Presence registry** | Every session appends `{name, pid, cwd, isolation}` to one JSONL registry (inside the git common dir — shared across worktrees, never committed). Crashed sessions drop out via **pid liveness**: the extension runs inside the agent process, so `process.pid` *is* the session pid. No ghost windows. |
 | **Git guard (peer-aware)** | Destructive verbs (`reset`, `checkout <ref>`, `stash`, `clean`, `rebase`, `merge`, `branch -D/-d`, `worktree remove`, `push --force`) are blocked at the shared root **only while other sessions are live**. Isolated sessions are never blocked. |
+| **Tree-scoped exemption** | A git op whose execution dir resolves **inside an isolated worktree/lane is never blocked** — not by the graded classes, the peer gate, or the in-flight gate: it is branch-local by construction. This covers a session cwd inside the tree, a leading `cd <worktree> &&` prefix (which overrides the tool's declared working dir), and `git -C <worktree> <verb>`. Ops resolving into the shared root keep the full guard. |
 | **Unconditional blocks** | `reset --hard/--keep` and `commit --amend` at the shared root are blocked even with no live peers — the victim is uncommitted state on disk, which no registry can see. |
 | **Broad-add guard** | `git add -A / --all / .` at the shared root is blocked while peers are live (their uncommitted files get swept into your commit). Path-scoped adds pass. |
 | **In-flight gate** | Git-mutating verbs are blocked while a rebase/merge/cherry-pick/revert/bisect is mid-flight (`rebase-merge/`, `MERGE_HEAD`, …) — **liveness-independent**, because a session that died mid-rebase looks exactly like "no session". |
-| **Edit containment** | Sessions inside an isolated worktree/lane cannot edit outside it; shared-root sessions get a warn-once tripwire when they edit *into* someone's isolated tree. |
+| **Edit containment** | Sessions inside an isolated worktree/lane cannot edit outside it; shared-root sessions get a warn-once tripwire when they edit *into* someone's isolated tree. The warn is **owner-aware** (see below): silent when the tree belongs to this session, names the live owner when one is working inside the tree, generic verify-ownership hint otherwise. |
 | **`/sessions`** | List live sessions (name, where, age) and recent claims; `/sessions claim <text>` declares intent. |
 | **Read-only hygiene** | Commands that merely *mention* a verb (`grep 'git clean -fd' log`) pass; `merge-base`, `stash list`, `checkout-index` never matched (false positives train agents to ignore guards). |
 
@@ -73,10 +74,38 @@ scope).
 | `gitGuard` / `editGuard` / `rootEditWarn` / `inFlightGuard` | `true` | Toggle individual layers. |
 | `registry` | git common dir (or `<root>/.pi-checkout-guard/`) | Registry file location, relative to root or absolute. |
 
+### Message size and token cost
+
+Guard messages stay small on purpose: peer lists are capped at **five names**,
+then collapse to `…and N more (/sessions for full list)`. When more than five
+sessions are live, the per-session `notifyHint` is replaced by a one-line
+suggestion to **broadcast once** (e.g. via your team's intercom channel)
+instead of messaging every session before each shared-root git op.
+
 Disable the extension entirely with `CHECKOUT_GUARD_DISABLE=1`.
 
 `GIT_CEILING_DIRECTORIES` is honored during workspace discovery (git-compatible),
 protecting against stray `.git` directories high in the tree.
+
+## Owner-aware tree warnings
+
+When a shared-root session edits inside an isolated tree, the guard tries to
+resolve the owner before warning:
+
+1. **Tree marker file** — if any `isolatedMarkers` file in the tree root holds
+   `OWNER_SESSION=<id>` and that id matches this session (its name or
+   `PI_SESSION_ID`, compared tolerantly: exact, or one is a prefix of the
+   other, so short and full session ids both work), the tree is yours and the
+   warn is **suppressed silently**. Worktree tooling can stamp this key when
+   it creates the tree; an absent or unreadable file is simply skipped.
+2. **Live registry peers** — a live session whose presence `cwd` sits inside
+   the tree is treated as its active owner: the warn still fires, but **names
+   them** (`Owned by <name> (live) — coordinate with them before editing.`)
+   so the next step is coordination, not detective work.
+3. **Nothing resolvable** — the generic verify-ownership warn fires once per
+   tree, exactly as before.
+
+Set `rootEditWarn: false` to disable the whole path.
 
 ## Cross-agent: Claude Code adapter
 

@@ -6,7 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { CheckoutGuard } from "../src/guard.ts";
 import { resolveWorkspace } from "../src/resolve.ts";
-import { appendClaim, appendPresence, readClaims, readLivePeers, removeSelf } from "../src/registry.ts";
+import { appendClaim, appendPresence, formatPeers, readClaims, readLivePeers, removeSelf } from "../src/registry.ts";
 
 function tmpdir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "ccg-"));
@@ -266,4 +266,157 @@ test("guard: shared session editing into isolated tree warns once", async () => 
   assert.ok(first !== undefined && "warn" in first);
   const second = guard.onEditCommand("write", { path: path.join(wt, "y.ts") }, root);
   assert.equal(second, undefined); // once per tree
+});
+
+test("guard: editing inside a tree this session owns (OWNER_SESSION) is silent", () => {
+  const root = tmpdir();
+  write(root, ".pi-checkout-guard.json", "{}");
+  const wt = path.join(root, "worktrees", "w1");
+  write(wt, ".worktree", "WORKTREE_NAME=w1\nOWNER_SESSION=test\n");
+  const ws = resolveWorkspace(root)!;
+  const guard = new CheckoutGuard(ws, { pid: process.pid, name: "test" });
+
+  assert.equal(guard.onEditCommand("write", { path: path.join(wt, "x.ts") }, root), undefined);
+  // once-per-tree bookkeeping: still silent on later edits
+  assert.equal(guard.onEditCommand("write", { path: path.join(wt, "y.ts") }, root), undefined);
+});
+
+test("guard: OWNER_SESSION tolerant id match — short/full session ids and PI_SESSION_ID", () => {
+  const root = tmpdir();
+  write(root, ".pi-checkout-guard.json", "{}");
+  const ws = resolveWorkspace(root)!;
+
+  // stamp holds the SHORT id, session name is the full id (prefix relation)
+  const wtShort = path.join(root, "worktrees", "short");
+  write(wtShort, ".worktree", "OWNER_SESSION=sess-42\n");
+  const byName = new CheckoutGuard(ws, { pid: process.pid, name: "sess-42-full-abcdef" });
+  assert.equal(byName.onEditCommand("write", { path: path.join(wtShort, "x.ts") }, root), undefined);
+
+  // stamp holds the FULL id, session only knows the short one via env
+  const wtFull = path.join(root, "worktrees", "full");
+  write(wtFull, ".worktree", "OWNER_SESSION=another-777-full-abcdef\n");
+  const prev = process.env.PI_SESSION_ID;
+  process.env.PI_SESSION_ID = "another-777";
+  try {
+    const byEnv = new CheckoutGuard(ws, { pid: process.pid, name: "unrelated-name" });
+    assert.equal(byEnv.onEditCommand("write", { path: path.join(wtFull, "x.ts") }, root), undefined);
+  } finally {
+    if (prev === undefined) delete process.env.PI_SESSION_ID;
+    else process.env.PI_SESSION_ID = prev;
+  }
+});
+
+test("guard: editing inside a foreign tree with a live owner names the owner; unknown keeps generic warn", () => {
+  const root = tmpdir();
+  write(root, ".pi-checkout-guard.json", "{}");
+  const owned = path.join(root, "worktrees", "owned");
+  write(owned, ".worktree", "WORKTREE_NAME=owned\n");
+  const unknown = path.join(root, "worktrees", "unknown");
+  write(unknown, ".worktree", "WORKTREE_NAME=unknown\n");
+  const ws = resolveWorkspace(root)!;
+  const guard = new CheckoutGuard(ws, { pid: process.pid, name: "test" });
+  const child = liveChild();
+  appendPresence(ws.registryPath, { name: "wt-owner", pid: child.pid, cwd: path.join(owned, "src") });
+
+  const named = guard.onEditCommand("write", { path: path.join(owned, "x.ts") }, root);
+  assert.ok(named !== undefined && "warn" in named);
+  assert.match(named.warn, /Owned by wt-owner \(live\) — coordinate with them before editing\./);
+  assert.doesNotMatch(named.warn, /verify ownership/);
+
+  // nothing resolvable: no OWNER_SESSION, no live peer inside the tree
+  const generic = guard.onEditCommand("write", { path: path.join(unknown, "x.ts") }, root);
+  assert.ok(generic !== undefined && "warn" in generic);
+  assert.match(generic.warn, /verify ownership \(live sessions: \/sessions\) before continuing\./);
+  child.kill();
+});
+
+test("guard: worktree-scoped git verbs never blocked (cd prefix, git -C, cwd inside the tree)", () => {
+  const root = tmpdir();
+  write(root, ".pi-checkout-guard.json", "{}");
+  const wtA = path.join(root, "worktrees", "wt-a");
+  write(wtA, ".worktree", "WORKTREE_NAME=wt-a\n");
+  const ws = resolveWorkspace(root)!;
+  const guard = new CheckoutGuard(ws, { pid: process.pid, name: "test" });
+  const child = liveChild();
+  appendPresence(ws.registryPath, { name: "peer", pid: child.pid, cwd: root });
+
+  // cd prefix into the worktree — with and without an explicit tool exec dir
+  assert.equal(guard.onBashCommand("cd worktrees/wt-a && git commit --amend --no-edit", undefined, root), undefined);
+  assert.equal(guard.onBashCommand("cd worktrees/wt-a && git commit --amend --no-edit", root, root), undefined);
+  // git -C into the worktree
+  assert.equal(guard.onBashCommand("git -C worktrees/wt-a commit --amend --no-edit", undefined, root), undefined);
+  assert.equal(guard.onBashCommand("git -C worktrees/wt-a push", undefined, root), undefined);
+  assert.equal(guard.onBashCommand("git -C worktrees/wt-a rebase main", undefined, root), undefined);
+  assert.equal(guard.onBashCommand("git -C worktrees/wt-a reset --hard", undefined, root), undefined);
+  // session cwd itself inside the worktree (guard resolved from the shared root)
+  assert.equal(guard.onBashCommand("git commit --amend --no-edit", undefined, wtA), undefined);
+  assert.equal(guard.onBashCommand("git rebase main", undefined, wtA), undefined);
+
+  // the same graded verbs at the shared root still block
+  assert.ok(guard.onBashCommand("git commit --amend --no-edit", undefined, root)?.block);
+  assert.ok(guard.onBashCommand("git rebase main", undefined, root)?.block);
+  assert.ok(guard.onBashCommand("git merge main", undefined, root)?.block);
+  child.kill();
+});
+
+test("guard: worktree-scoped verbs are exempt from the in-flight gate too", () => {
+  const root = plainRepo();
+  write(root, ".git/rebase-merge", "on to main\n");
+  const wtA = path.join(root, "worktrees", "wt-a");
+  write(wtA, ".worktree", "WORKTREE_NAME=wt-a\n");
+  const ws = resolveWorkspace(root)!;
+  const guard = new CheckoutGuard(ws, { pid: process.pid, name: "test" });
+
+  assert.equal(guard.onBashCommand("cd worktrees/wt-a && git push", undefined, root), undefined);
+  assert.equal(guard.onBashCommand("git -C worktrees/wt-a push", undefined, root), undefined);
+  // shared-root mutations still hit the in-flight gate
+  const blocked = guard.onBashCommand("git push", undefined, root);
+  assert.ok(blocked?.block);
+  assert.match(blocked.reason, /rebase-merge/);
+});
+
+test("formatPeers caps the visible list at 5 names with an …and N more tail", () => {
+  const root = plainRepo();
+  const reg = resolveWorkspace(root)!.registryPath;
+  const fakeNow = Date.now();
+  const now = () => fakeNow;
+  const children = Array.from({ length: 7 }, (_, i) => liveChild());
+  children.forEach((c, i) => appendPresence(reg, { name: `p${i + 1}`, pid: c.pid, cwd: root }, now));
+  const peers = readLivePeers(reg, process.pid, 12 * 3600_000, now);
+
+  const crowded = formatPeers(peers, root);
+  assert.ok(crowded.includes("  - p5 —"));
+  assert.ok(!crowded.includes("  - p6 —"));
+  assert.match(crowded, /…and 2 more \(\/sessions for full list\)/);
+
+  const small = formatPeers(peers.slice(0, 5), root);
+  assert.ok(small.includes("  - p5 —"));
+  assert.doesNotMatch(small, /…and /);
+  children.forEach((c) => c.kill());
+});
+
+test("guard: block message swaps per-session notifyHint for a broadcast hint when peers exceed 5", () => {
+  const root = plainRepo();
+  const ws = resolveWorkspace(root)!;
+  const guard = new CheckoutGuard(ws, { pid: process.pid, name: "test" });
+
+  const children = Array.from({ length: 6 }, () => liveChild());
+  children.forEach((c, i) => appendPresence(ws.registryPath, { name: `p${i + 1}`, pid: c.pid, cwd: root }));
+  const crowded = guard.onBashCommand("git merge main", undefined, root);
+  assert.ok(crowded?.block);
+  assert.match(crowded.reason, /…and 1 more \(\/sessions for full list\)/);
+  assert.match(crowded.reason, /broadcast once \(e\.g\. via intercom\)/);
+  assert.doesNotMatch(crowded.reason, /Message the session\(s\) listed above/);
+  children.forEach((c) => c.kill());
+
+  const one = liveChild();
+  const root2 = plainRepo();
+  const ws2 = resolveWorkspace(root2)!;
+  const guard2 = new CheckoutGuard(ws2, { pid: process.pid, name: "test" });
+  appendPresence(ws2.registryPath, { name: "solo", pid: one.pid, cwd: root2 });
+  const small = guard2.onBashCommand("git merge main", undefined, root2);
+  assert.ok(small?.block);
+  assert.match(small.reason, /Message the session\(s\) listed above before proceeding\./);
+  assert.doesNotMatch(small.reason, /broadcast once/);
+  one.kill();
 });

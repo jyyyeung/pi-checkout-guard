@@ -136,15 +136,22 @@ export function readClaims(registryPath: string, limit = 5, now: () => number = 
     .reverse();
 }
 
+/** Visible peer rows in guard messages; beyond this the list collapses to
+ *  a `…and N more` line so coordination hints stay cheap to read. */
+export const PEER_LIST_CAP = 5;
+
 export function formatPeers(peers: LivePeer[], rootDir: string): string {
   if (peers.length === 0) return "  (no other live sessions)";
-  return peers
-    .slice(0, 6)
-    .map((r) => {
-      const age = Math.round(r.ageMs / 60000);
-      const where = (r.cwd || "").startsWith(rootDir + "/") ? (r.cwd || "").slice(rootDir.length + 1) : (r.cwd || "");
-      const ref = r.ref ? ` (${r.kind}:${r.ref})` : r.kind ? ` (${r.kind})` : "";
-      return `  - ${r.name}${ref} — ${where || "."} — active ${age}m ago`;
-    })
-    .join("\n") + (peers.length > 6 ? `\n  ...and ${peers.length - 6} more` : "");
+  return (
+    peers
+      .slice(0, PEER_LIST_CAP)
+      .map((r) => {
+        const age = Math.round(r.ageMs / 60000);
+        const where = (r.cwd || "").startsWith(rootDir + "/") ? (r.cwd || "").slice(rootDir.length + 1) : (r.cwd || "");
+        const ref = r.ref ? ` (${r.kind}:${r.ref})` : r.kind ? ` (${r.kind})` : "";
+        return `  - ${r.name}${ref} — ${where || "."} — active ${age}m ago`;
+      })
+      .join("\n") +
+    (peers.length > PEER_LIST_CAP ? `\n  …and ${peers.length - PEER_LIST_CAP} more (/sessions for full list)` : "")
+  );
 }

@@ -25,8 +25,8 @@ import {
   isReadOnlyMention,
   stripQuotes,
 } from "./git-rules.ts";
-import { type WorkspaceInfo, findIsolatedTree, isInside, resolveWorkspace } from "./resolve.ts";
-import { type LivePeer, formatPeers, readLivePeers } from "./registry.ts";
+import { type WorkspaceInfo, findIsolatedTree, isInside, readMarker, resolveWorkspace } from "./resolve.ts";
+import { PEER_LIST_CAP, type LivePeer, formatPeers, readLivePeers } from "./registry.ts";
 
 export interface GuardDecision {
   block: true;
@@ -84,6 +84,14 @@ export class CheckoutGuard {
     return formatPeers(this.livePeers(), this.ws.root);
   }
 
+  /** Coordination line for block messages: with a crowd of live sessions the
+   *  per-session notifyHint becomes a token sink — suggest one broadcast. */
+  private notifyLine(peers: LivePeer[]): string {
+    return peers.length > PEER_LIST_CAP
+      ? `${peers.length} live sessions is too many to message one by one — broadcast once (e.g. via intercom) instead of notifying each session.`
+      : this.ws.config.notifyHint;
+  }
+
   private inFlightMarkers(): string[] {
     const common = this.ws.gitCommonDir;
     if (!common) return [];
@@ -111,18 +119,23 @@ export class CheckoutGuard {
     // workspace at all — a brand-new dir, an unrelated tree) is not this
     // session's shared root and must pass (incident: `git init` in a fresh
     // sibling project dir was blocked as a shared-root mutation).
-    const targetRaw = execDir || extractCdTarget(command);
-    if (targetRaw) {
-      const abs = path.isAbsolute(targetRaw) ? targetRaw : path.resolve(sessionCwd, stripQuotes(targetRaw));
+    const resolvesOutsideSharedRoot = (raw: string | undefined): boolean => {
+      if (!raw) return false;
+      const abs = path.isAbsolute(raw) ? raw : path.resolve(sessionCwd, stripQuotes(raw));
       const target = resolveWorkspace(abs);
-      if (!target || target.sessionKind === "isolated" || target.root !== this.ws.root) return undefined;
-    }
+      return !target || target.sessionKind === "isolated" || target.root !== this.ws.root;
+    };
+    // An explicit `cd <dir> &&` prefix executes FIRST, so it wins over the
+    // tool's declared working dir (regression: `cd <worktree> && git commit
+    // --amend` was blocked because the bash-in dir masked the cd target).
+    const cdTarget = extractCdTarget(command) ?? execDir;
     const gitC = extractGitCDir(command);
-    if (gitC) {
-      const abs = path.isAbsolute(gitC) ? gitC : path.resolve(sessionCwd, stripQuotes(gitC));
-      const target = resolveWorkspace(abs);
-      if (!target || target.sessionKind === "isolated" || target.root !== this.ws.root) return undefined;
-    }
+    if (resolvesOutsideSharedRoot(cdTarget) || resolvesOutsideSharedRoot(gitC)) return undefined;
+    // No explicit execution dir: the op runs at the session cwd. If THAT
+    // resolves inside an isolated tree (guard instance resolved earlier from
+    // the shared root; the session has since moved into its worktree), the
+    // op is branch-local by construction — never guarded.
+    if (!cdTarget && !gitC && resolvesOutsideSharedRoot(sessionCwd)) return undefined;
 
     if (isReadOnlyMention(command)) return undefined;
 
@@ -170,7 +183,7 @@ export class CheckoutGuard {
         `pi-checkout-guard: \`${command.trim().slice(0, 120)}\` ${what}` +
         (unconditional ? "" : ` while ${peers.length} other live session(s) are registered here:`) +
         `\n${this.formatPeers()}\n\n` +
-        `${this.ws.config.notifyHint}\n` +
+        `${this.notifyLine(peers)}\n` +
         `If nobody is affected, re-run with ${this.ws.config.overrideEnv}=1 prefixed to the same command.`,
     };
   }
@@ -209,6 +222,14 @@ export class CheckoutGuard {
     }
 
     // Shared session editing INTO an isolated tree: warn once per tree.
+    // Owner-aware (incident: the session that created a worktree was warned
+    // about "foreign edits" in its own tree on every checkout). Resolution:
+    //   1. OWNER_SESSION key in the tree's marker/meta file — a self-match
+    //      (session name or PI_SESSION_ID, short or full id) means this tree
+    //      is ours: silent.
+    //   2. A live peer session currently working inside the tree: warn, but
+    //      name the owner so the next step is coordination, not detective work.
+    //   3. Nothing resolvable: generic verify-ownership warn.
     if (this.ws.config.rootEditWarn) {
       for (const field of PATH_FIELDS) {
         const value = input[field];
@@ -216,17 +237,39 @@ export class CheckoutGuard {
         const abs = path.isAbsolute(value) ? value : path.resolve(sessionCwd, value);
         const iso = findIsolatedTree(abs, this.ws.config);
         if (iso && !this.warnedTrees.has(iso.root)) {
-          this.warnedTrees.add(iso.root);
+          this.warnedTrees.add(iso.root); // once per tree: suppressions stay silent too
+          if (this.treeOwnerIsSelf(iso.root)) return undefined;
+          const peer = this.livePeerInsideTree(iso.root);
           return {
             warn:
               `pi-checkout-guard WARN (not blocked): this shared-root session is editing inside ` +
               `isolated ${iso.kind} '${iso.name}' (${iso.root}). Foreign edits in isolated trees are a ` +
-              `top data-loss class — verify ownership (live sessions: /sessions) before continuing.`,
+              (peer
+                ? `top data-loss class — Owned by ${peer.name} (live) — coordinate with them before editing.`
+                : `top data-loss class — verify ownership (live sessions: /sessions) before continuing.`),
           };
         }
       }
     }
     return undefined;
+  }
+
+  /** OWNER_SESSION in any marker/meta file of the tree matches this session?
+   *  Tolerant id match: exact, or one is a prefix of the other (stamps may
+   *  hold short or full session ids). Missing/unreadable files are fine. */
+  private treeOwnerIsSelf(treeRoot: string): boolean {
+    const ids = [this.name, process.env.PI_SESSION_ID].filter((v): v is string => typeof v === "string" && v.length > 0);
+    for (const marker of this.ws.config.isolatedMarkers) {
+      const owner = readMarker(treeRoot, marker)["OWNER_SESSION"];
+      if (!owner) continue;
+      if (ids.some((id) => owner === id || owner.startsWith(id) || id.startsWith(owner))) return true;
+    }
+    return false;
+  }
+
+  /** Live peer currently working inside the tree (presence cwd inside it). */
+  private livePeerInsideTree(treeRoot: string): LivePeer | undefined {
+    return this.livePeers().find((p) => typeof p.cwd === "string" && isInside(p.cwd, treeRoot));
   }
 }
 
