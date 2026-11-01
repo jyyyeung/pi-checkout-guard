@@ -1,19 +1,20 @@
 # pi-checkout-guard
 
+[![npm](https://img.shields.io/npm/v/pi-checkout-guard?style=flat&logo=npm&logoColor=white)](https://www.npmjs.com/package/pi-checkout-guard) [![CI](https://img.shields.io/github/actions/workflow/status/jyyyeung/pi-checkout-guard/test.yml?style=flat&logo=github&label=CI)](https://github.com/jyyyeung/pi-checkout-guard/actions/workflows/test.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat)](https://opensource.org/licenses/MIT) [![Pi](https://img.shields.io/badge/pi-%E2%89%A51.3-6366F1?style=flat)](https://pi.dev) [![Node](https://img.shields.io/badge/node-%E2%89%A520-339933?style=flat&logo=node.js&logoColor=white)](https://nodejs.org)
+
 Ambient session presence + peer-aware safety guard for **shared git checkouts**.
 
-Several AI coding-agent sessions share ONE physical checkout. Git gives a
-checkout one `HEAD` and one index — a `git reset --hard` in any session
-silently destroys every other session's uncommitted work, `git add -A`
-sweeps foreign WIP into your commit, and a session that dies mid-rebase
-leaves a trap the next session commits into. Real incidents behind this
-design include irrecoverable WIP wipes and commits landing on a detached
-HEAD left by a crashed rebase 22 hours earlier.
+Git gives a checkout one `HEAD` and one index. Run several agent sessions in
+the same checkout and a `git reset --hard` in one of them silently destroys
+every other session's uncommitted work, `git add -A` sweeps foreign WIP into
+your commit, and a session that dies mid-rebase leaves a trap the next session
+commits into. The incidents behind this design include irrecoverable WIP wipes
+and a commit landing on a detached HEAD left by a crashed rebase 22 hours
+earlier.
 
-**pi-checkout-guard makes those sessions visible to each other and grades
-the dangerous operations accordingly.** It is ambient: presence is
-registered automatically at session start — no agent cooperation, no manual
-`lock acquire` calls.
+pi-checkout-guard makes those sessions visible to each other and grades the
+dangerous operations accordingly. It is ambient: presence is registered
+automatically at session start — no agent cooperation, no manual `lock acquire`.
 
 ```
 session A (shared root)                session B (shared root)
@@ -23,6 +24,65 @@ session A (shared root)                session B (shared root)
       Message B first, or prefix       │
       CHECKOUT_GUARD_OVERRIDE=1"       │
 ```
+
+Install it if you run more than one agent session — or one agent and one human
+editor — in the same checkout.
+
+## Install
+
+```bash
+pi install npm:pi-checkout-guard
+```
+
+Then restart pi (or `/reload`). Works with zero configuration in any plain
+git repository.
+
+From a local checkout:
+
+```bash
+pi install ./pi-checkout-guard
+pi -e ./pi-checkout-guard/extensions/checkout-guard.ts
+```
+
+Workspace discovery runs lazily from the session cwd on every tool call, so
+starting pi outside a repository and then working inside one is not a dead end.
+The `bash` and `powershell` tools are both guarded. Drop a
+`.pi-checkout-guard.json` at a directory to declare a **multi-repo workspace**:
+all child repos and worktrees under it become one coordination scope.
+
+## Quick start
+
+Start two sessions in the same checkout. In the second one, ask for something
+destructive:
+
+```
+> reset the working tree, I want to start over
+
+⛔ pi-checkout-guard: `git reset --hard` discards ALL uncommitted changes at the
+   shared checkout (peers' WIP included, even sessions that never registered).
+   Recover via git reflog, or reset inside your own worktree while 1 other live
+   session(s) are registered here:
+
+   • fix-auth — /repo — active 4m ago
+
+   Message the session(s) listed above before proceeding.
+
+   If nobody is affected, re-run with CHECKOUT_GUARD_OVERRIDE=1 prefixed to the
+   same command.
+```
+
+The blocked command never ran. Check who is there at any time:
+
+```
+> /sessions
+```
+
+### Commands
+
+| Command | What it does |
+|---|---|
+| `/sessions` | Live sessions (name, where, how long ago they were seen), recent claims, and whether the registry is damaged. |
+| `/sessions claim <text>` | Declare what this session is working on, so peers see it. |
 
 ## What it does
 
@@ -35,7 +95,6 @@ session A (shared root)                session B (shared root)
 | **Broad-add guard** | `git add -A / --all / .` at the shared root is blocked while peers are live (their uncommitted files get swept into your commit). Path-scoped adds pass. |
 | **In-flight gate** | Git-mutating verbs are blocked while a rebase/merge/cherry-pick/revert/bisect is mid-flight (`rebase-merge/`, `MERGE_HEAD`, …) — **liveness-independent**, because a session that died mid-rebase looks exactly like "no session". **The way out is never blocked**: `git rebase --abort|--continue|--skip`, `git merge --abort`, `git cherry-pick --abort` are classified as *resolving* the operation, so the escape hatch cannot be gated by the thing it escapes (a second verb on the same line still counts: `git rebase --abort; git reset --hard` is still parsed as destructive). |
 | **Edit containment** | Sessions inside an isolated worktree/lane cannot edit outside it; shared-root sessions get a warn-once tripwire when they edit *into* someone's isolated tree. The warn is **owner-aware** (see below): silent when the tree belongs to this session, names the live owner when one is working inside the tree, generic verify-ownership hint otherwise. |
-| **`/sessions`** | List live sessions (name, where, age) and recent claims; `/sessions claim <text>` declares intent. |
 | **Read-only hygiene** | Commands that merely *mention* a verb (`grep 'git clean -fd' log`) pass; `merge-base`, `stash list`, `checkout-index` never matched (false positives train agents to ignore guards). |
 
 ## When you are alone
@@ -53,21 +112,6 @@ session, so be explicit about what a solo session gets:
 If you never run concurrent sessions, this extension is mostly inert: the
 unconditional three are the only blocks you will ever see, and the override
 prefix clears each one.
-
-## Install
-
-```bash
-pi install npm:pi-checkout-guard
-```
-
-Works with zero configuration in any plain git repository. The workspace is
-resolved lazily from the session cwd on every tool call, so starting pi
-outside a repo and then working inside one is not a dead end (the extension
-used to resolve once at load and stay passive for the whole session). **bash
-and powershell** tool calls are both guarded. Drop
-`.pi-checkout-guard.json` at a directory to declare a **multi-repo
-workspace** (all child repos + worktrees under it become one coordination
-scope).
 
 ## Configuration (`.pi-checkout-guard.json`)
 
@@ -142,20 +186,6 @@ peer-aware, graded) is skipped for that op, so Claude Code sessions driving
 their own worktrees are never false-blocked; commands resolving at the
 shared root keep the full guard.
 
-## How this differs from neighbors
-
-| | peer-aware | liveness | worktree-aware | override | harness |
-|---|---|---|---|---|---|
-| **pi-checkout-guard** | yes, ambient | **true pid** (in-process) + TTL (adapter) | isolation both directions + in-flight gate | per-command env | pi + Claude adapter |
-| static safety nets (e.g. cc-safety-net) | no | n/a | no | policy | many CLIs |
-| TTL session locks (e.g. session-lock-style hooks) | yes | heartbeat TTL (ghost window) | lock scope only | per-command | Claude Code |
-| manual locks (e.g. agent-lock) | yes | manual acquire/release | per-path claims | manual | any CLI |
-
-Design credit: the in-flight-operation gate and the multi-session lock-map
-idea were pioneered by Claude Code community hooks (session-lock lineage);
-pi-checkout-guard adds true pid liveness, incident-graded severity, edit
-containment, and a documented cross-agent registry format.
-
 ## When the registry is damaged
 
 One unreadable line used to collapse the whole file to "no peers" — the guard
@@ -180,6 +210,86 @@ One JSON object per line, append-only:
   (`expireAt` in the future AND `ts` fresh).
 - Third-party tools may append rows following this shape; unknown fields are
   ignored.
+
+## How this differs from neighbors
+
+| | peer-aware | liveness | worktree-aware | override | harness |
+|---|---|---|---|---|---|
+| **pi-checkout-guard** | yes, ambient | **true pid** (in-process) + TTL (adapter) | isolation both directions + in-flight gate | per-command env | pi + Claude adapter |
+| static safety nets (e.g. cc-safety-net) | no | n/a | no | policy | many CLIs |
+| TTL session locks (e.g. session-lock-style hooks) | yes | heartbeat TTL (ghost window) | lock scope only | per-command | Claude Code |
+| manual locks (e.g. agent-lock) | yes | manual acquire/release | per-path claims | manual | any CLI |
+
+Design credit: the in-flight-operation gate and the multi-session lock-map
+idea were pioneered by Claude Code community hooks (session-lock lineage);
+pi-checkout-guard adds true pid liveness, incident-graded severity, edit
+containment, and a documented cross-agent registry format.
+
+## Scope and non-goals
+
+- **Not a sandbox.** It grades git operations and edits into isolated trees. It
+  does not prevent `rm -rf`, and it is not a permission system
+  (use [pi-permission-system](https://www.npmjs.com/package/@gotgenes/pi-permission-system)
+  for tool/path policy).
+- **Not a lock manager.** No per-file claims, no acquire/release dance; the
+  registry is presence, and presence is automatic.
+- **Not a merge resolver.** It refuses the operations that destroy work; it
+  never tries to merge two sessions' state.
+- **Peers must be visible.** Sessions in a *different* checkout, on another
+  machine, or in a terminal where the extension is not loaded cannot be
+  protected — the registry only knows what joined it.
+
+## Requirements
+
+| Requirement | Needed for | If missing |
+|---|---|---|
+| pi ≥ 1.3 | everything | the extension does not load |
+| Node ≥ 20 | everything | same |
+| git | everything | workspace discovery finds nothing; the guard stays passive |
+| Claude Code | the optional adapter | pi sessions still see each other |
+
+No network access, no telemetry, no runtime dependencies beyond pi's own
+packages.
+
+## Troubleshooting
+
+**Blocked with no other sessions listed.** That is the unconditional class —
+`reset --hard`, `reset --keep`, `commit --amend` at the shared root — and it
+means the state being discarded cannot be verified by anyone (a crashed
+session's WIP still looks like nobody's). Override with
+`CHECKOUT_GUARD_OVERRIDE=1` when you know it is yours.
+
+**Blocked and the message mentions unparsable registry lines.** Something wrote
+a broken row into the registry. Peer state is unknown, so the guard fails
+closed. Delete the registry file (`/sessions` prints the path); it rebuilds as
+sessions re-register.
+
+**Can't finish or abort a rebase.** You can: `rebase --continue`, `--abort`,
+`--skip` and `merge --abort` are never gated. If you wrote
+`git rebase --abort; git reset --hard` on one line, the second verb is still
+graded — split the line.
+
+**Nothing ever blocks.** Check `CHECKOUT_GUARD_DISABLE` is unset, that you are
+in a repository, and that `/sessions` lists your peers. Sessions in different
+checkouts are invisible to each other by design.
+
+**A worktree session gets blocked.** It should not: ops resolving inside a
+marked isolated tree skip every git gate. Either the tree is not marked
+(`.worktree`/`.lane` file, or a linked worktree with a `.git` file) or the
+command resolves to the shared root.
+
+## Related packages
+
+Five extensions for the same problem — agent sessions sharing a checkout —
+covering different moments:
+
+| Package | Moment | Guards against |
+|---|---|---|
+| [pi-rc-gate](https://github.com/jyyyeung/pi-rc-gate) | at execution | the failure signal being destroyed, so a red command is reported green |
+| **pi-checkout-guard** (this) | during | concurrent sessions wiping each other's uncommitted work |
+| [pi-closeout](https://github.com/jyyyeung/pi-closeout) | at session end | the dirty state a session leaves for the next one |
+| [pi-retro](https://github.com/jyyyeung/pi-retro) | weekly | friction that keeps recurring because nobody wrote it down |
+| [pi-handoff](https://github.com/jyyyeung/pi-handoff) | between sessions | context lost when a session ends |
 
 ## Development
 
