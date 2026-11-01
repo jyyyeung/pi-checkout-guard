@@ -1,6 +1,6 @@
 {
   "name": "pi-checkout-guard",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "type": "module",
   "license": "MIT",
   "description": "Ambient session presence + peer-aware safety guard for shared git checkouts: blocks destructive git ops while other agent sessions are live, and stops edits escaping isolated worktrees.",

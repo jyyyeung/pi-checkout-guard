@@ -21,8 +21,10 @@
  * model). Registry/config resolution mirrors src/resolve.ts simplified:
  * walk up for .pi-checkout-guard.json, then .git.
  *
- * NOTE: the git verb regexes are duplicated from src/git-rules.ts (TypeScript
- * source is not importable from a no-build hook). Keep them in sync.
+ * NOTE: the git verb regexes and the cd/-C target extraction helpers are
+ * duplicated from src/git-rules.ts (TypeScript source is not importable from
+ * a no-build hook), and the tree-scoped exemption mirrors src/guard.ts.
+ * Keep them in sync.
  */
 
 import * as fs from "node:fs";
@@ -34,6 +36,52 @@ const TTL_MS = 5 * 60 * 1000; // expireAt freshness for hook-written rows
 
 function stripQuoted(command) {
   return command.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, ' "…" ');
+}
+
+function stripQuotes(value) {
+  return value.replace(/^"|"$/g, "").replace(/^'|'$/g, "");
+}
+
+/** Leading `cd <dir> &&` — command executes at dir, not session cwd. */
+function extractCdTarget(command) {
+  const m = command.match(/^\s*cd\s+("[^"]+"|'[^']+'|\S+)\s*&&/);
+  return m?.[1];
+}
+
+/** `git -C <dir> <verb>` — op executes inside dir. */
+function extractGitCDir(command) {
+  const m = command.match(/\bgit\s+-C\s+("[^"]+"|'[^']+'|\S+)/);
+  return m?.[1];
+}
+
+function isFile(p) {
+  try {
+    return fs.statSync(p).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Walk up from dir to (exclusive) the shared root: an isolation marker file
+ *  or a linked-worktree `.git` FILE means dir sits inside an isolated tree. */
+function insideIsolatedTree(dir, root, markers) {
+  for (let d = path.resolve(dir); d !== root && path.dirname(d) !== d; d = path.dirname(d)) {
+    if (markers.some((m) => fs.existsSync(path.join(d, m)))) return true;
+    if (isFile(path.join(d, ".git"))) return true;
+  }
+  return false;
+}
+
+/** Git ops resolving outside the shared root are never guarded (mirrors
+ *  src/guard.ts): no workspace at all, a different checkout, or a directory
+ *  inside an isolated tree are branch-local by construction. */
+function resolvesOutsideSharedRoot(raw, ws, markers, sessionCwd) {
+  if (!raw) return false;
+  const unquoted = stripQuotes(raw);
+  const abs = path.isAbsolute(unquoted) ? unquoted : path.resolve(sessionCwd, unquoted);
+  const target = findRoot(abs);
+  if (!target || target.root !== ws.root) return true;
+  return insideIsolatedTree(abs, ws.root, markers);
 }
 
 const DESTRUCTIVE_GIT =
@@ -48,6 +96,7 @@ const READONLY_PREFIX =
 const GIT_MUTATING =
   /\bgit\s+(?:-{1,2}[\w-]+\s+)*(?:commit\b|push\b|checkout(?!-index)\b|switch\b|branch\b|merge(?!-(?:base|ours|theirs|file))\b|rebase\b|reset\b|cherry-pick\b|revert\b|pull\b|am\b|apply\b|stash\b|add\b|rm\b|mv\b)/;
 const IN_FLIGHT_MARKERS = ["rebase-merge", "rebase-apply", "MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG"];
+const DEFAULT_ISOLATED_MARKERS = [".worktree", ".lane"];
 
 function readStdin() {
   try {
@@ -155,6 +204,24 @@ if (ws) {
     if (!verdict.destructive && !verdict.amend && !verdict.resetHard && !verdict.broadAdd && !verdict.mutating) {
       process.exit(0);
     }
+
+    // Tree-scoped exemption (mirrors src/guard.ts): an explicit `cd <dir> &&`
+    // prefix executes first, so it wins over the session cwd; `git -C <dir>`
+    // is checked the same way. When the op's dir resolves inside an isolated
+    // tree — or outside this shared root entirely — every git-verb gate
+    // (in-flight, peer, graded) is skipped: branch-local ops never block.
+    const isolatedMarkers = Array.isArray(ws.config.isolatedMarkers) ? ws.config.isolatedMarkers : DEFAULT_ISOLATED_MARKERS;
+    const sessionCwd = String(input.cwd ?? process.cwd());
+    const cdTarget = extractCdTarget(command);
+    const gitC = extractGitCDir(command);
+    if (
+      resolvesOutsideSharedRoot(cdTarget, ws, isolatedMarkers, sessionCwd) ||
+      resolvesOutsideSharedRoot(gitC, ws, isolatedMarkers, sessionCwd) ||
+      (!cdTarget && !gitC && resolvesOutsideSharedRoot(sessionCwd, ws, isolatedMarkers, sessionCwd))
+    ) {
+      process.exit(0);
+    }
+
     if (READONLY_PREFIX.test(command)) process.exit(0);
 
     if (ws.config.inFlightGuard !== false && verdict.mutating && ws.gitDir) {

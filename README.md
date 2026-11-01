@@ -114,7 +114,13 @@ with the same rules, so Claude Code sessions and pi sessions see each
 other. Claude hooks are ephemeral processes, so adapter rows use a
 heartbeat-refreshed TTL (`expireAt`) instead of pid liveness — same
 trade-off as TTL-style session locks. Wiring snippet is in the hook file
-header.
+header. The adapter also mirrors the main guard's tree-scoped git-verb
+exemption: when a command's execution directory (a leading `cd <dir> &&`, a
+`git -C <dir>`, or the session cwd itself) resolves inside an isolated tree
+— or outside the shared checkout entirely — every git-verb gate (in-flight,
+peer-aware, graded) is skipped for that op, so Claude Code sessions driving
+their own worktrees are never false-blocked; commands resolving at the
+shared root keep the full guard.
 
 ## How this differs from neighbors
 
