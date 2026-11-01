@@ -6,7 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { CheckoutGuard } from "../src/guard.ts";
 import { resolveWorkspace } from "../src/resolve.ts";
-import { appendClaim, appendPresence, formatPeers, readClaims, readLivePeers, removeSelf } from "../src/registry.ts";
+import { alive, appendClaim, appendPresence, formatPeers, readClaims, readLivePeers, removeSelf } from "../src/registry.ts";
 
 function tmpdir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "ccg-"));
@@ -419,4 +419,116 @@ test("guard: block message swaps per-session notifyHint for a broadcast hint whe
   assert.match(small.reason, /Message the session\(s\) listed above before proceeding\./);
   assert.doesNotMatch(small.reason, /broadcast once/);
   one.kill();
+});
+
+test("guard: abort-like verbs are never blocked by the in-flight gate (the deadlock)", () => {
+  const root = plainRepo();
+  write(root, ".git/rebase-merge", "on to main\n");
+  const ws = resolveWorkspace(root)!;
+  const guard = new CheckoutGuard(ws, { pid: process.pid, name: "solo-session" });
+  // regression: these were blocked by the very gate whose message told you to run them
+  assert.equal(guard.onBashCommand("git rebase --abort", undefined, root), undefined);
+  assert.equal(guard.onBashCommand("git rebase --continue", undefined, root), undefined);
+  assert.equal(guard.onBashCommand("git rebase --skip", undefined, root), undefined);
+  assert.equal(guard.onBashCommand("git merge --abort", undefined, root), undefined);
+  assert.equal(guard.onBashCommand("git cherry-pick --abort", undefined, root), undefined);
+  // a second, genuinely mutating verb on the same line still counts
+  const both = guard.onBashCommand("git rebase --abort; git commit -m wip", undefined, root);
+  assert.ok(both?.block);
+});
+
+test("guard: abort-like verbs pass with a live peer too", () => {
+  const root = plainRepo();
+  write(root, ".git/rebase-merge", "on to main\n");
+  const peer = liveChild();
+  try {
+    const ws = resolveWorkspace(root)!;
+    const guard = new CheckoutGuard(ws, { pid: process.pid, name: "me" });
+    appendPresence(ws.registryPath, { name: "peer", pid: peer.pid, cwd: root, kind: "shared" });
+    assert.equal(guard.onBashCommand("git rebase --abort", undefined, root), undefined);
+  } finally {
+    peer.kill();
+  }
+});
+
+test("guard: a damaged registry fails CLOSED, not open", () => {
+  const root = plainRepo();
+  const peer = liveChild();
+  try {
+    const ws = resolveWorkspace(root)!;
+    const guard = new CheckoutGuard(ws, { pid: process.pid, name: "me" });
+    appendPresence(ws.registryPath, { name: "peer", pid: peer.pid, cwd: root, kind: "shared" });
+    fs.appendFileSync(ws.registryPath, "{oops not json\n");
+    // regression: one bad line made readLivePeers() return [] -> `git checkout .` passed
+    const decision = guard.onBashCommand("git checkout .", undefined, root);
+    assert.ok(decision?.block);
+    assert.match(decision.reason, /unparsable line/);
+    assert.match(decision.reason, /CHECKOUT_GUARD_OVERRIDE=1/);
+    // the override still works, and read-only ops are unaffected
+    assert.equal(guard.onBashCommand("CHECKOUT_GUARD_OVERRIDE=1 git checkout .", undefined, root), undefined);
+    assert.equal(guard.onBashCommand("git status", undefined, root), undefined);
+    assert.equal(guard.registryDamage, 1);
+  } finally {
+    peer.kill();
+  }
+});
+
+test("guard: read-only spellings pass at one peer, real ones still block", () => {
+  const root = plainRepo();
+  const peer = liveChild();
+  try {
+    const ws = resolveWorkspace(root)!;
+    const guard = new CheckoutGuard(ws, { pid: process.pid, name: "me" });
+    appendPresence(ws.registryPath, { name: "peer", pid: peer.pid, cwd: root, kind: "shared" });
+    // read-only / non-destructive spellings that used to be blocked
+    assert.equal(guard.onBashCommand("git clean -nd", undefined, root), undefined);
+    assert.equal(guard.onBashCommand("git clean -nfd", undefined, root), undefined);
+    assert.equal(guard.onBashCommand("git clean --dry-run", undefined, root), undefined);
+    assert.equal(guard.onBashCommand("git checkout -b feat/x", undefined, root), undefined);
+    assert.equal(guard.onBashCommand("git switch -c feat/y", undefined, root), undefined);
+    // gaps that used to pass
+    assert.ok(guard.onBashCommand("git clean -fd", undefined, root)?.block);
+    assert.ok(guard.onBashCommand("git branch --delete old", undefined, root)?.block);
+    assert.ok(guard.onBashCommand("git push origin +main", undefined, root)?.block);
+    assert.ok(guard.onBashCommand("git push --delete origin old", undefined, root)?.block);
+    assert.ok(guard.onBashCommand("git push --force-with-lease", undefined, root)?.block);
+    // path-discarding checkout forms still block
+    assert.ok(guard.onBashCommand("git checkout -b x -- .", undefined, root)?.block);
+    assert.ok(guard.onBashCommand("git checkout .", undefined, root)?.block);
+  } finally {
+    peer.kill();
+  }
+});
+
+test("guard: solo unconditional block does not tell you to message sessions that do not exist", () => {
+  const root = plainRepo();
+  const ws = resolveWorkspace(root)!;
+  const guard = new CheckoutGuard(ws, { pid: process.pid, name: "solo" });
+  const decision = guard.onBashCommand("git reset --hard HEAD", undefined, root);
+  assert.ok(decision?.block);
+  assert.doesNotMatch(decision.reason, /no other live sessions/);
+  assert.doesNotMatch(decision.reason, /Message the session\(s\) listed above/);
+  assert.match(decision.reason, /no other live session registered/);
+});
+
+test("registry: alive() treats EPERM as alive (process exists, other owner)", () => {
+  // pid 1 always exists and is never ours -> EPERM on any normal account
+  assert.equal(alive(1), true);
+  assert.equal(alive(process.pid), true);
+  assert.equal(alive(0x7ffffff0), false); // ESRCH
+});
+
+test("registry: one corrupt line no longer erases every live peer", () => {
+  const root = plainRepo();
+  const peer = liveChild();
+  try {
+    const ws = resolveWorkspace(root)!;
+    appendPresence(ws.registryPath, { name: "peer", pid: peer.pid, cwd: root, kind: "shared" });
+    fs.appendFileSync(ws.registryPath, "{oops not json\n");
+    const peers = readLivePeers(ws.registryPath, process.pid, 12 * 3600_000);
+    assert.equal(peers.length, 1);
+    assert.equal(peers[0].name, "peer");
+  } finally {
+    peer.kill();
+  }
 });

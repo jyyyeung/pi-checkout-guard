@@ -113,3 +113,61 @@ test("adapter: worktree-scoped verbs exempt from the in-flight gate too", async 
   const cwd = await runAdapter(hookInput(wtA, "git push"));
   assert.equal(cwd.code, 0, cwd.stderr);
 });
+
+test("adapter: abort-like verbs survive the in-flight gate (was a deadlock)", async () => {
+  const root = plainRepo();
+  write(root, ".git/rebase-merge", "on to main\n");
+  for (const command of ["git rebase --abort", "git rebase --continue", "git merge --abort"]) {
+    const { code, stderr } = await runAdapter({
+      hook_event_name: "PreToolUse",
+      cwd: root,
+      session_id: "claude-solo",
+      tool_name: "Bash",
+      tool_input: { command },
+    });
+    assert.equal(code, 0, `${command} must be allowed; got ${code}: ${stderr}`);
+  }
+  // a genuine mutation mid-flight still blocks
+  const { code } = await runAdapter({
+    hook_event_name: "PreToolUse",
+    cwd: root,
+    session_id: "claude-solo",
+    tool_name: "Bash",
+    tool_input: { command: "git reset --hard HEAD" },
+  });
+  assert.equal(code, 2);
+});
+
+test("adapter: damaged registry fails closed", async () => {
+  const root = plainRepo();
+  const reg = path.join(root, ".git", "pi-checkout-guard", "registry.jsonl");
+  fs.mkdirSync(path.dirname(reg), { recursive: true });
+  const now = Date.now();
+  fs.writeFileSync(
+    reg,
+    `${JSON.stringify({ ts: now, type: "presence", name: "peer", session: "s1", cwd: root, expireAt: now + 300000 })}\n{oops not json\n`,
+  );
+  const { code, stderr } = await runAdapter({
+    hook_event_name: "PreToolUse",
+    cwd: root,
+    session_id: "claude-solo",
+    tool_name: "Bash",
+    tool_input: { command: "git checkout ." },
+  });
+  assert.equal(code, 2, "corrupt peer state must block, not allow");
+  assert.match(stderr, /unparsable line/);
+});
+
+test("adapter: solo unconditional block message never says to message absent sessions", async () => {
+  const root = plainRepo();
+  const { code, stderr } = await runAdapter({
+    hook_event_name: "PreToolUse",
+    cwd: root,
+    session_id: "claude-solo",
+    tool_name: "Bash",
+    tool_input: { command: "git reset --hard HEAD" },
+  });
+  assert.equal(code, 2);
+  assert.doesNotMatch(stderr, /Message the session\(s\) listed above/);
+  assert.doesNotMatch(stderr, /no other live sessions/);
+});

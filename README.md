@@ -29,14 +29,30 @@ session A (shared root)                session B (shared root)
 | Layer | Behavior |
 |---|---|
 | **Presence registry** | Every session appends `{name, pid, cwd, isolation}` to one JSONL registry (inside the git common dir — shared across worktrees, never committed). Crashed sessions drop out via **pid liveness**: the extension runs inside the agent process, so `process.pid` *is* the session pid. No ghost windows. |
-| **Git guard (peer-aware)** | Destructive verbs (`reset`, `checkout <ref>`, `stash`, `clean`, `rebase`, `merge`, `branch -D/-d`, `worktree remove`, `push --force`) are blocked at the shared root **only while other sessions are live**. Isolated sessions are never blocked. |
+| **Git guard (peer-aware)** | Destructive verbs (`reset`, `checkout <ref>`, `stash`, `clean -f`, `rebase`, `merge`, `branch -d/-D/--delete`, `worktree remove`, `push --force/-f/--force-with-lease/--delete/+refspec`) are blocked at the shared root **only while other sessions are live**. Isolated sessions are never blocked. Read-only spellings of the same verbs pass: `clean -n/--dry-run`, `stash list|show`, `checkout -b/-B/--orphan` (creates a branch — `git switch -c`, the same operation under another name, was never blocked either). |
 | **Tree-scoped exemption** | A git op whose execution dir resolves **inside an isolated worktree/lane is never blocked** — not by the graded classes, the peer gate, or the in-flight gate: it is branch-local by construction. This covers a session cwd inside the tree, a leading `cd <worktree> &&` prefix (which overrides the tool's declared working dir), and `git -C <worktree> <verb>`. Ops resolving into the shared root keep the full guard. |
 | **Unconditional blocks** | `reset --hard/--keep` and `commit --amend` at the shared root are blocked even with no live peers — the victim is uncommitted state on disk, which no registry can see. |
 | **Broad-add guard** | `git add -A / --all / .` at the shared root is blocked while peers are live (their uncommitted files get swept into your commit). Path-scoped adds pass. |
-| **In-flight gate** | Git-mutating verbs are blocked while a rebase/merge/cherry-pick/revert/bisect is mid-flight (`rebase-merge/`, `MERGE_HEAD`, …) — **liveness-independent**, because a session that died mid-rebase looks exactly like "no session". |
+| **In-flight gate** | Git-mutating verbs are blocked while a rebase/merge/cherry-pick/revert/bisect is mid-flight (`rebase-merge/`, `MERGE_HEAD`, …) — **liveness-independent**, because a session that died mid-rebase looks exactly like "no session". **The way out is never blocked**: `git rebase --abort|--continue|--skip`, `git merge --abort`, `git cherry-pick --abort` are classified as *resolving* the operation, so the escape hatch cannot be gated by the thing it escapes (a second verb on the same line still counts: `git rebase --abort; git reset --hard` is still parsed as destructive). |
 | **Edit containment** | Sessions inside an isolated worktree/lane cannot edit outside it; shared-root sessions get a warn-once tripwire when they edit *into* someone's isolated tree. The warn is **owner-aware** (see below): silent when the tree belongs to this session, names the live owner when one is working inside the tree, generic verify-ownership hint otherwise. |
 | **`/sessions`** | List live sessions (name, where, age) and recent claims; `/sessions claim <text>` declares intent. |
 | **Read-only hygiene** | Commands that merely *mention* a verb (`grep 'git clean -fd' log`) pass; `merge-base`, `stash list`, `checkout-index` never matched (false positives train agents to ignore guards). |
+
+## When you are alone
+
+The single most common reason to uninstall a guard is a block on a solo
+session, so be explicit about what a solo session gets:
+
+| Command (no other live session) | Result |
+|---|---|
+| `git push`, `git commit`, `git merge`, `git checkout <ref>`, `git stash`, `git clean -fd` | allowed — peer-scoped rules with no peers have nothing to protect |
+| `git reset --hard`, `git reset --keep`, `git commit --amend` | **blocked** — these discard uncommitted state that no registry can see (a crashed session's WIP, a teammate's, your own second checkout). Block messages say so plainly and never refer to sessions that do not exist. |
+| anything mid-flight (rebase/merge/cherry-pick state present) | **blocked**, except the abort/continue/skip verbs that resolve it |
+| any of the above, prefixed `CHECKOUT_GUARD_OVERRIDE=1` | allowed, once |
+
+If you never run concurrent sessions, this extension is mostly inert: the
+unconditional three are the only blocks you will ever see, and the override
+prefix clears each one.
 
 ## Install
 
@@ -44,7 +60,11 @@ session A (shared root)                session B (shared root)
 pi install npm:pi-checkout-guard
 ```
 
-Works with zero configuration in any plain git repository. Drop
+Works with zero configuration in any plain git repository. The workspace is
+resolved lazily from the session cwd on every tool call, so starting pi
+outside a repo and then working inside one is not a dead end (the extension
+used to resolve once at load and stay passive for the whole session). **bash
+and powershell** tool calls are both guarded. Drop
 `.pi-checkout-guard.json` at a directory to declare a **multi-repo
 workspace** (all child repos + worktrees under it become one coordination
 scope).
@@ -135,6 +155,16 @@ Design credit: the in-flight-operation gate and the multi-session lock-map
 idea were pioneered by Claude Code community hooks (session-lock lineage);
 pi-checkout-guard adds true pid liveness, incident-graded severity, edit
 containment, and a documented cross-agent registry format.
+
+## When the registry is damaged
+
+One unreadable line used to collapse the whole file to "no peers" — the guard
+then treated a busy checkout as empty, which is the worst possible failure
+mode for a safety tool. Parsing is now per line: damaged lines are counted,
+and a destructive git op is **blocked with the file path and a repair
+instruction** instead of silently allowed. Read-only commands and the
+`CHECKOUT_GUARD_OVERRIDE=1` prefix still work, so you are never locked out.
+`/sessions` reports the damage count.
 
 ## Registry format (spec)
 

@@ -42,21 +42,51 @@ export function alive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
-    return false;
+  } catch (err) {
+    // EPERM means the process EXISTS but belongs to another user (containers,
+    // sudo-launched agents, shared dev boxes). Reading it as dead was fail-open
+    // and silently dropped real peers. Only ESRCH (no such process) is dead.
+    return (err as NodeJS.ErrnoException)?.code === "EPERM";
   }
 }
 
-function readRows(registryPath: string): RegistryRow[] {
+export interface RegistryRead {
+  rows: RegistryRow[];
+  /** Lines that were not valid JSON — peer state is incomplete by that much. */
+  damaged: number;
+}
+
+/** Parse line by line: ONE corrupt line must never erase every other peer
+ *  (a whole-file try/catch returned [] and the guard then treated a busy
+ *  checkout as empty — fail-open on the only data it has). Damage is counted
+ *  and reported so callers can block instead of guessing. */
+export function readRegistry(registryPath: string): RegistryRead {
+  let text: string;
   try {
-    return fs
-      .readFileSync(registryPath, "utf8")
-      .split("\n")
-      .filter((l) => l.trim())
-      .map((l) => JSON.parse(l) as RegistryRow);
+    text = fs.readFileSync(registryPath, "utf8");
   } catch {
-    return [];
+    return { rows: [], damaged: 0 }; // no registry yet is not damage
   }
+  const rows: RegistryRow[] = [];
+  let damaged = 0;
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const parsed = JSON.parse(line) as unknown;
+      if (parsed && typeof parsed === "object" && typeof (parsed as RegistryRow).type === "string") {
+        rows.push(parsed as RegistryRow);
+      } else {
+        damaged++;
+      }
+    } catch {
+      damaged++;
+    }
+  }
+  return { rows, damaged };
+}
+
+function readRows(registryPath: string): RegistryRow[] {
+  return readRegistry(registryPath).rows;
 }
 
 function append(registryPath: string, row: RegistryRow): void {
@@ -112,8 +142,20 @@ export function readLivePeers(
   staleMs: number,
   now: () => number = Date.now,
 ): LivePeer[] {
+  return readLivePeersReport(registryPath, selfPid, staleMs, now).peers;
+}
+
+/** Same liveness read, plus the damaged-line count so the guard can fail CLOSED
+ *  (block, "peer state unknown") instead of open (allow, "nobody here"). */
+export function readLivePeersReport(
+  registryPath: string,
+  selfPid: number,
+  staleMs: number,
+  now: () => number = Date.now,
+): { peers: LivePeer[]; damaged: number } {
   const nowMs = now();
-  return readRows(registryPath).flatMap((r): LivePeer[] => {
+  const { rows, damaged } = readRegistry(registryPath);
+  const peers = rows.flatMap((r): LivePeer[] => {
     if (r.type !== "presence") return [];
     if (r.pid === selfPid) return [];
     if (nowMs - r.ts >= staleMs) return [];
@@ -126,6 +168,7 @@ export function readLivePeers(
     }
     return [{ ...r, ageMs: nowMs - r.ts }];
   });
+  return { peers, damaged };
 }
 
 /** Latest claim per live session, newest first. */

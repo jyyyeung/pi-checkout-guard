@@ -8,9 +8,23 @@
  * trained agents to ignore the guard, which is worse than no guard.
  */
 
+/** In-flight operations END, they do not destroy: `git rebase --abort|--continue
+ *  |--skip|--quit` (likewise merge/cherry-pick/revert/am) are the documented
+ *  escape from a stuck operation. Classifying them as mutations deadlocked the
+ *  in-flight gate — the gate blocked the very command its own message told you
+ *  to run, leaving the env override as the only exit. Stripped before verb
+ *  matching (see classifyGit) and surfaced as `abortLike` for messaging. */
+export const ABORT_LIKE_GIT =
+  /\bgit\s+(?:rebase|merge|cherry-pick|revert|am)\s+(?:-[\w-]+\s+)*--(?:abort|continue|skip|quit)\b/;
+
+/** Read-only `git clean` forms: -n in any short cluster (-n, -nd, -nfd) or
+ *  --dry-run only LIST what would be removed. `clean -fd` still destroys. */
+const CLEAN_DESTRUCTIVE = 'clean(?!\\s+(?:-{1,2}[\\w-]*n[\\w-]*|--dry-run)\\b)';
+
 /** Destructive/state-destroying git verbs. Reads never match. */
-export const DESTRUCTIVE_GIT =
-  /\bgit\s+(?:-{1,2}[\w-]+\s+)*(?:reset\b|stash(?!\s+(?:list|show|log))\b|checkout(?!-index)\b|restore\b|clean\b|rebase\b|merge(?!-(?:base|ours|theirs|file))\b|branch\s+-\w*[Dd]\b|worktree\s+(?:remove|destroy)\b|push\s+.*--force)/;
+export const DESTRUCTIVE_GIT = new RegExp(
+  String.raw`\bgit\s+(?:-{1,2}[\w-]+\s+)*(?:reset\b|stash(?!\s+(?:list|show|log))\b|checkout(?!-index)\b|restore\b|${CLEAN_DESTRUCTIVE}|rebase\b|merge(?!-(?:base|ours|theirs|file))\b|branch\s+(?:-\w*[Dd]\b|--delete\b)|worktree\s+(?:remove|destroy)\b|push\b[^;&|]*(?:--force(?:-with-lease)?\b|-f\b|--delete\b|(?:^|\s)\+[^\s;&|]+))`,
+);
 
 /** `git commit --amend` at the shared root can rewrite another session's
  *  already-pushed commit — blocked regardless of live peers. */
@@ -32,7 +46,9 @@ export const READONLY_PREFIX =
   /^\s*(?:grep|rg|fgrep|egrep|ack|echo|printf|sed|awk|cat|head|tail|less|wc)\b/;
 
 /** Git verbs that mutate repo state — used by the in-flight-operation gate
- *  (blocking NEW mutations while a rebase/merge/cherry-pick is mid-flight). */
+ *  (blocking NEW mutations while a rebase/merge/cherry-pick is mid-flight).
+ *  Abort-like verbs are stripped before this test: they RESOLVE the in-flight
+ *  state and must never be blocked by it. */
 export const GIT_MUTATING =
   /\bgit\s+(?:-{1,2}[\w-]+\s+)*(?:commit\b|push\b|checkout(?!-index)\b|switch\b|branch\b|merge(?!-(?:base|ours|theirs|file))\b|rebase\b|reset\b|cherry-pick\b|revert\b|pull\b|am\b|apply\b|stash\b|add\b|rm\b|mv\b)/;
 
@@ -52,6 +68,8 @@ export interface GitVerdict {
   resetHard: boolean;
   broadAdd: boolean;
   mutating: boolean;
+  /** `git <op> --abort|--continue|--skip|--quit`: resolves an in-flight op. */
+  abortLike: boolean;
 }
 
 /** Strip quoted segments ("..." and '...') before verb matching: a commit
@@ -63,14 +81,38 @@ export function stripQuoted(command: string): string {
   return command.replace(/"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'/g, ' "…" ');
 }
 
+/** Replace abort-like invocations so they cannot be read as mutations, while
+ *  leaving any OTHER verb on the same command line intact
+ *  (`git rebase --abort; git reset --hard` still classifies as destructive). */
+function stripAbortLike(command: string): string {
+  return command.replace(
+    /\bgit\s+(?:rebase|merge|cherry-pick|revert|am)\s+(?:-[\w-]+\s+)*--(?:abort|continue|skip|quit)\b/g,
+    "git op-resolved",
+  );
+}
+
+/** `git checkout -b <name>` / `-B` / `--orphan` CREATE a branch: nothing is
+ *  discarded, so it is not destructive — the same operation spelled
+ *  `git switch -c` was never guarded, and the inconsistency taught agents that
+ *  `checkout -b` is the way around the guard. A pathspec after `--` (or a bare
+ *  `.`) still means "throw away worktree changes" and keeps matching. */
+function stripCreateBranch(command: string): string {
+  return command.replace(
+    /\bgit\s+checkout\s+(?:-b|-B|--orphan)\s+\S+([^;&|]*)/g,
+    (match, rest: string) =>
+      /(?:^|\s)--(?:\s|$)|(?:^|\s)\.(?:\s|$)/.test(rest) ? match : "git branch-create",
+  );
+}
+
 export function classifyGit(command: string): GitVerdict {
-  const bare = stripQuoted(command);
+  const bare = stripCreateBranch(stripAbortLike(stripQuoted(command)));
   return {
     destructive: DESTRUCTIVE_GIT.test(bare),
     amend: AMEND_ROOT_GIT.test(bare),
     resetHard: RESET_HARD_ROOT_GIT.test(bare),
     broadAdd: BROAD_ADD_GIT.test(bare),
     mutating: GIT_MUTATING.test(bare),
+    abortLike: ABORT_LIKE_GIT.test(stripQuoted(command)),
   };
 }
 

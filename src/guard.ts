@@ -26,7 +26,7 @@ import {
   stripQuotes,
 } from "./git-rules.ts";
 import { type WorkspaceInfo, findIsolatedTree, isInside, readMarker, resolveWorkspace } from "./resolve.ts";
-import { PEER_LIST_CAP, type LivePeer, formatPeers, readLivePeers } from "./registry.ts";
+import { PEER_LIST_CAP, type LivePeer, formatPeers, readLivePeersReport } from "./registry.ts";
 
 export interface GuardDecision {
   block: true;
@@ -77,7 +77,17 @@ export class CheckoutGuard {
   }
 
   livePeers(): LivePeer[] {
-    return readLivePeers(this.ws.registryPath, this.pid, this.ws.config.staleMs, this.now);
+    return this.peerReport().peers;
+  }
+
+  /** Live peers + damaged-line count. Damage is reported, never swallowed:
+   *  the registry is the only evidence the guard has about other sessions. */
+  private peerReport(): { peers: LivePeer[]; damaged: number } {
+    return readLivePeersReport(this.ws.registryPath, this.pid, this.ws.config.staleMs, this.now);
+  }
+
+  get registryDamage(): number {
+    return this.peerReport().damaged;
   }
 
   formatPeers(): string {
@@ -165,7 +175,22 @@ export class CheckoutGuard {
       return undefined;
     }
 
-    const peers = this.livePeers();
+    const { peers, damaged } = this.peerReport();
+    if (damaged > 0) {
+      // Fail CLOSED. A corrupt registry line used to collapse the whole file to
+      // "no peers" — one bad byte silently disarmed the guard for a busy
+      // checkout. Blocking with an actionable repair keeps the failure loud.
+      return {
+        block: true,
+        reason:
+          `pi-checkout-guard: cannot verify other sessions — ${damaged} unparsable line(s) in ` +
+          `${this.ws.registryPath}, so peer state is unknown. Destructive git ops stay blocked ` +
+          `until it is repaired.\n` +
+          `Repair: read the file, delete the damaged line(s), or delete the file entirely to ` +
+          `reset presence tracking (live sessions re-register on their next start).\n` +
+          `If you have verified nobody is affected, re-run with ${this.ws.config.overrideEnv}=1 prefixed.`,
+      };
+    }
     const unconditional = verdict.amend || verdict.resetHard;
     if (!unconditional && peers.length === 0) return undefined;
 
@@ -177,13 +202,20 @@ export class CheckoutGuard {
           ? "sweeps OTHER sessions' uncommitted files into your commit (use path-scoped `git add <paths>`)"
           : "mutates shared git state at the shared checkout";
 
+    // Only talk about peers when there ARE peers: solo sessions used to get
+    // "  (no other live sessions)" followed by "Message the session(s) listed
+    // above" — telling them to coordinate with sessions that do not exist.
+    const peerSection =
+      peers.length > 0
+        ? ` while ${peers.length} other live session(s) are registered here:\n${this.formatPeers()}\n\n${this.notifyLine(peers)}\n`
+        : `\nThis is blocked with no other live session registered: it discards work that may never have ` +
+          `been registered at all (a crashed session's WIP, a teammate's, your own other checkout).\n`;
+
     return {
       block: true,
       reason:
         `pi-checkout-guard: \`${command.trim().slice(0, 120)}\` ${what}` +
-        (unconditional ? "" : ` while ${peers.length} other live session(s) are registered here:`) +
-        `\n${this.formatPeers()}\n\n` +
-        `${this.notifyLine(peers)}\n` +
+        peerSection +
         `If nobody is affected, re-run with ${this.ws.config.overrideEnv}=1 prefixed to the same command.`,
     };
   }
@@ -262,7 +294,7 @@ export class CheckoutGuard {
     for (const marker of this.ws.config.isolatedMarkers) {
       const owner = readMarker(treeRoot, marker)["OWNER_SESSION"];
       if (!owner) continue;
-      if (ids.some((id) => owner === id || owner.startsWith(id) || id.startsWith(owner))) return true;
+      if (ids.some((id) => idMatches(owner, id))) return true;
     }
     return false;
   }
@@ -271,6 +303,19 @@ export class CheckoutGuard {
   private livePeerInsideTree(treeRoot: string): LivePeer | undefined {
     return this.livePeers().find((p) => typeof p.cwd === "string" && isInside(p.cwd, treeRoot));
   }
+}
+
+/** Tolerant id match for OWNER_SESSION stamps (they may hold a short id, a
+ *  full id, or PI_SESSION_ID). The shorter side must be a real id prefix that
+ *  BREAKS AT A SEPARATOR — a bare `startsWith` let a 2-3 character session name
+ *  ("pi", "w1") match almost any owner and silenced the warn for every foreign
+ *  tree. */
+function idMatches(a: string, b: string): boolean {
+  if (a === b) return true;
+  const [short, long] = a.length <= b.length ? [a, b] : [b, a];
+  if (short.length < 4) return false;
+  if (!long.startsWith(short)) return false;
+  return /^[-_:.]/.test(long.slice(short.length));
 }
 
 export function sessionDisplayName(env: Record<string, string | undefined> = process.env, argv: string[] = process.argv): string {
