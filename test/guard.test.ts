@@ -6,7 +6,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { CheckoutGuard } from "../src/guard.ts";
 import { resolveWorkspace } from "../src/resolve.ts";
-import { alive, appendClaim, appendPresence, formatPeers, readClaims, readLivePeers, removeSelf } from "../src/registry.ts";
+import { alive, appendClaim, appendPresence, formatPeers, readClaims, readLivePeers, readRegistry, removeSelf } from "../src/registry.ts";
 
 function tmpdir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "ccg-"));
@@ -120,9 +120,14 @@ test("registry: removeSelf drops own presence rows only", () => {
   appendPresence(reg, { name: "me", pid: process.pid, cwd: root });
   appendClaim(reg, "me", process.pid, "doing x");
   removeSelf(reg, process.pid);
-  const live = readLivePeers(reg, 999, 12 * 3600_000);
-  // pid 111 is dead -> filtered by liveness, not removal; claim rows persist
-  assert.equal(live.length, 0);
+  // Assert on the rows themselves, not on liveness: whether some unrelated
+  // process owns pid 111 depends on the environment (a CI container's low
+  // pids are live), which made a readLivePeers-based assertion fail off-laptop.
+  const rows = readRegistry(reg).rows;
+  const presence = rows.filter((r) => r.type === "presence");
+  assert.equal(presence.length, 1);
+  assert.equal(presence[0].name, "a");
+  // claim rows persist: removeSelf only drops presence rows
   assert.equal(readClaims(reg).length, 1);
 });
 
