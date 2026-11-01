@@ -56,20 +56,18 @@ Start two sessions in the same checkout. In the second one, ask for something
 destructive:
 
 ```
-> reset the working tree, I want to start over
+pi-checkout-guard: `git reset --hard` discards ALL uncommitted changes at the
+shared checkout (peers' WIP included, even sessions that never registered).
+Recover via git-reflog/reflog of the stash, or reset inside your own worktree
+while 1 other live session(s) are registered here:
+  - fix-auth (shared) — /repo — active 4m ago
 
-⛔ pi-checkout-guard: `git reset --hard` discards ALL uncommitted changes at the
-   shared checkout (peers' WIP included, even sessions that never registered).
-   Recover via git reflog, or reset inside your own worktree while 1 other live
-   session(s) are registered here:
-
-   • fix-auth — /repo — active 4m ago
-
-   Message the session(s) listed above before proceeding.
-
-   If nobody is affected, re-run with CHECKOUT_GUARD_OVERRIDE=1 prefixed to the
-   same command.
+Message the session(s) listed above before proceeding.
+If nobody is affected, re-run with CHECKOUT_GUARD_OVERRIDE=1 prefixed to the
+same command.
 ```
+
+(Wrapped here for reading; the block reason arrives as a few long lines.)
 
 The blocked command never ran. Check who is there at any time:
 
@@ -88,8 +86,8 @@ The blocked command never ran. Check who is there at any time:
 
 | Layer | Behavior |
 |---|---|
-| **Presence registry** | Every session appends `{name, pid, cwd, isolation}` to one JSONL registry (inside the git common dir — shared across worktrees, never committed). Crashed sessions drop out via **pid liveness**: the extension runs inside the agent process, so `process.pid` *is* the session pid. No ghost windows. |
-| **Git guard (peer-aware)** | Destructive verbs (`reset`, `checkout <ref>`, `stash`, `clean -f`, `rebase`, `merge`, `branch -d/-D/--delete`, `worktree remove`, `push --force/-f/--force-with-lease/--delete/+refspec`) are blocked at the shared root **only while other sessions are live**. Isolated sessions are never blocked. Read-only spellings of the same verbs pass: `clean -n/--dry-run`, `stash list|show`, `checkout -b/-B/--orphan` (creates a branch — `git switch -c`, the same operation under another name, was never blocked either). |
+| **Presence registry** | Every session appends `{name, pid, cwd, kind}` (`kind` is `shared` or `isolated`, plus `ref` for a worktree/lane) to one JSONL registry (inside the git common dir — shared across worktrees, never committed). Crashed sessions drop out via **pid liveness**: the extension runs inside the agent process, so `process.pid` *is* the session pid. No ghost windows. |
+| **Git guard (peer-aware)** | Destructive verbs (`reset`, `checkout <ref>`, `restore`, `stash`, `clean -f`, `rebase`, `merge`, `branch -d/-D/--delete`, `worktree remove|destroy`, `push --force/-f/--force-with-lease/--delete/+refspec`) are blocked at the shared root **only while other sessions are live**. Isolated sessions are never blocked. Read-only spellings of the same verbs pass: `clean -n/--dry-run`, `stash list|show|log`, `checkout -b/-B/--orphan` (creates a branch — `git switch -c`, the same operation under another name, was never blocked either). |
 | **Tree-scoped exemption** | A git op whose execution dir resolves **inside an isolated worktree/lane is never blocked** — not by the graded classes, the peer gate, or the in-flight gate: it is branch-local by construction. This covers a session cwd inside the tree, a leading `cd <worktree> &&` prefix (which overrides the tool's declared working dir), and `git -C <worktree> <verb>`. Ops resolving into the shared root keep the full guard. |
 | **Unconditional blocks** | `reset --hard/--keep` and `commit --amend` at the shared root are blocked even with no live peers — the victim is uncommitted state on disk, which no registry can see. |
 | **Broad-add guard** | `git add -A / --all / .` at the shared root is blocked while peers are live (their uncommitted files get swept into your commit). Path-scoped adds pass. |
@@ -124,8 +122,7 @@ prefix clears each one.
   "gitGuard": true,
   "editGuard": true,
   "rootEditWarn": true,
-  "inFlightGuard": true,
-  "registry": ".session-registry.jsonl"
+  "inFlightGuard": true
 }
 ```
 
@@ -136,7 +133,7 @@ prefix clears each one.
 | `overrideEnv` | `CHECKOUT_GUARD_OVERRIDE` | Prefix a blocked command with `<overrideEnv>=1` to override once. |
 | `notifyHint` | see above | Appended to block messages — put your team's coordination channel here. |
 | `gitGuard` / `editGuard` / `rootEditWarn` / `inFlightGuard` | `true` | Toggle individual layers. |
-| `registry` | git common dir (or `<root>/.pi-checkout-guard/`) | Registry file location, relative to root or absolute. |
+| `registry` | unset → `<git common dir>/pi-checkout-guard/registry.jsonl` (or `<root>/.pi-checkout-guard/registry.jsonl` when the config file sits at the root, or when there is no git dir) | Override the registry file: a path relative to the root, or absolute. |
 
 ### Message size and token cost
 
@@ -202,12 +199,16 @@ One JSON object per line, append-only:
 
 ```jsonl
 {"ts":1730000000000,"type":"presence","name":"alice","pid":4242,"cwd":"/repo","kind":"shared"}
-{"ts":1730000000000,"type":"presence","name":"claude-x","session":"uuid","cwd":"/repo","expireAt":1730000300000}
+{"ts":1730000000000,"type":"presence","name":"w1","pid":4343,"cwd":"/repo/.worktree/w1","kind":"isolated","ref":"w1"}
+{"ts":1730000000000,"type":"presence","name":"claude-x","cwd":"/repo","kind":"shared","expireAt":1730000300000}
 {"ts":1730000100000,"type":"claim","name":"alice","pid":4242,"claim":"fixing auth flow"}
 ```
 
-- `presence` rows are live while (`pid` alive AND `ts` fresh) or
-  (`expireAt` in the future AND `ts` fresh).
+- `presence` rows are live while `ts` is fresh **and** either `pid` is a live
+  process or, for rows written by a TTL adapter (no `pid`), `expireAt` is still
+  in the future. A row with neither is ignored.
+- `claim` rows are what `/sessions` prints under `Recent claims` — the latest
+  five, dropped once older than `staleMs`.
 - Third-party tools may append rows following this shape; unknown fields are
   ignored.
 

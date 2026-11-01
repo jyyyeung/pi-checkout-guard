@@ -36,7 +36,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import * as fs from "node:fs";
 import { CheckoutGuard, sessionDisplayName } from "../src/guard.ts";
-import { appendClaim, appendPresence, removeSelf } from "../src/registry.ts";
+import { appendClaim, appendPresence, readClaims, removeSelf } from "../src/registry.ts";
 import { resolveWorkspace, type WorkspaceInfo } from "../src/resolve.ts";
 
 const TRACE = process.env.CHECKOUT_GUARD_TRACE === "1";
@@ -111,9 +111,16 @@ export default function checkoutGuardExtension(pi: ExtensionAPI): void {
         return;
       }
       const damage = current.guard.registryDamage;
+      // Claims are written by `claim <text>`; without this they were write-only.
+      const now = Date.now();
+      const claims = readClaims(current.guard.registryPath)
+        .filter((c) => now - c.ts < current.ws.config.staleMs)
+        .map((c) => `  - ${c.name}: ${c.claim} (${Math.round((now - c.ts) / 60000)}m ago)`)
+        .join("\n");
       report(
         ctx,
         `Live sessions in ${current.ws.root}:\n${current.guard.formatPeers()}` +
+          (claims ? `\n\nRecent claims:\n${claims}` : "") +
           (damage > 0 ? `\n\nWARNING: ${damage} unparsable line(s) in ${current.guard.registryPath} — peer state is incomplete; destructive git ops are blocked until it is repaired.` : ""),
       );
     },

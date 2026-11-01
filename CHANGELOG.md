@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.4]
+
+### Fixed
+
+- **`/sessions claim <text>` was write-only.** `readClaims` existed in
+  `src/registry.ts` but nothing called it, so a claim row was written to the
+  registry and never shown to anyone. `/sessions` now prints a `Recent claims`
+  block (the latest five claims newer than `staleMs`).
+
+### Docs
+
+- README checked claim-by-claim against the source: the real block message,
+  presence rows use `kind` (not `isolation`) and carry `ref` for a
+  worktree/lane, `restore` is in the destructive list, `stash log` is a
+  read-only form, `registry` has no default value in the config file, and the
+  registry spec rows match what the adapter writes.
+
 ## [0.1.3]
 
 ### Fixed
