@@ -245,7 +245,7 @@ containment, and a documented cross-agent registry format.
 | Requirement | Needed for | If missing |
 |---|---|---|
 | pi ≥ 1.3 | everything | the extension does not load |
-| Node ≥ 20 | everything | same |
+| Node ≥ 20 (22.6+ to run the tests) | everything | same |
 | git | everything | workspace discovery finds nothing; the guard stays passive |
 | Claude Code | the optional adapter | pi sessions still see each other |
 
